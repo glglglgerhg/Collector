@@ -39,8 +39,8 @@ CACHE_DIR = DATA_DIR / "sub_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
 TANDEM_SERVERS = [
-    {"url": "https://2.27.86.119:2096/sub/{secret}", "name": "Germany", "flag": "🇩🇪", "type": "general"},   
-    {"url": "https://195.133.9.107:2096/sub/{secret}", "name": "Netherlands", "flag": "🇳🇱", "type": "reserve"},
+    {"url": "https://150.251.152.178:2096/sub/{secret}", "name": "Germany", "flag": "🇩🇪", "type": "general"},
+    {"url": "https://150.251.152.176:2096/sub/{secret}", "name": "Netherlands", "flag": "🇳🇱", "type": "reserve"},
 ]
 
 WHITELIST_SOURCES = [
