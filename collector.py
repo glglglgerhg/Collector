@@ -20,6 +20,7 @@ import threading
 import struct
 import sqlite3
 import os
+from queue import Queue, Empty
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -72,6 +73,8 @@ logger = logging.getLogger(__name__)
 
 PANEL_USER = os.getenv("PANEL_USER", "admin")
 PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "change-me")
+LOG_QUEUE_MAXSIZE = 5000
+_log_queue = Queue(maxsize=LOG_QUEUE_MAXSIZE)
 
 
 def get_db_connection():
@@ -239,22 +242,53 @@ def fetch_tandem_server(server, secret):
         response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, verify=False, timeout=10)
         
         if response.status_code != 200:
-            logger.error(f"HTTP {response.status_code} from {server['name']}")
-            return []
-        
-        subscription_text = decode_subscription(response.text)
-        if not subscription_text:
-            logger.error(f"Failed to decode from {server['name']}")
-            return []
-        
-        configs = extract_configs(subscription_text)
-        logger.info(f"Got {len(configs)} configs from {server['name']}")
-        
-        fixed_configs = []
-        for cfg in configs:
-            suffix = "🎬 YouTube" if server["type"] == "youtube" else "🌍 General"
-            name = extract_name_from_config(cfg)
-            new_name = f"{server['flag']} {server['name']} | {suffix}" + (f" | {name}" if name else "")
+def write_subscription_log(payload):
+    client_ip = payload.get("client_ip", "")
+                country, region_name, city, lat, lon, geo_source
+                payload.get("ts", int(time.time())),
+                payload.get("secret", ""),
+                payload.get("requested_url", ""),
+                payload.get("hwid", ""),
+                payload.get("device", ""),
+                payload.get("os_name", ""),
+                payload.get("user_agent", ""),
+def enqueue_subscription_access(secret):
+    payload = {
+        "ts": int(time.time()),
+        "secret": secret,
+        "requested_url": request.full_path[:-1] if request.full_path.endswith("?") else request.full_path,
+        "client_ip": get_client_ip(),
+        "hwid": request.args.get("hwid") or request.headers.get("X-HWID", ""),
+        "device": request.args.get("device") or request.headers.get("X-Device", ""),
+        "os_name": request.args.get("os") or request.headers.get("X-OS", ""),
+        "user_agent": request.headers.get("User-Agent", ""),
+    }
+    try:
+        _log_queue.put_nowait(payload)
+    except Exception:
+        logger.warning("Log queue is full; skipping one subscription log entry")
+
+
+def start_log_worker():
+    def worker():
+        while True:
+            try:
+                payload = _log_queue.get(timeout=1)
+            except Empty:
+                continue
+            try:
+                write_subscription_log(payload)
+            except Exception as e:
+                logger.error(f"Failed to write subscription log: {e}")
+            finally:
+                _log_queue.task_done()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    logger.info("🧾 Log worker started")
+
+
+start_log_worker()
             cfg = re.sub(r'#.*$', '', cfg)
             fixed_configs.append(f"{cfg}#{new_name}")
         
@@ -629,7 +663,7 @@ def panel():
 @panel_auth_required
 def panel_map():
     period = request.args.get("period", "month")
-    since_ts = get_time_from_filter(period)
+    enqueue_subscription_access(secret)
     with get_db_connection() as conn:
         rows = conn.execute(
             """
@@ -683,17 +717,32 @@ def panel_map():
         const points = {json.dumps(markers)};
         for (const p of points) {{
           const dt = new Date(p.last_ts * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-          const text = `<b>${{p.ip || 'unknown'}}</b><br>${{[p.country, p.region_name, p.city].filter(Boolean).join(' / ')}}<br>Запросов: ${{p.cnt}}<br>Последний: ${{dt}}`;
-          L.circleMarker([p.lat, p.lon], {{radius: Math.min(12, 4 + p.cnt), color: '#2563eb'}}).addTo(map).bindPopup(text);
-        }}
-      </script>
-    </body>
-    </html>
-    """
-
-
-@app.route('/whitelist')
-@app.route('/whitelist/')
+    :root{--bg:#0f172a;--card:#111827;--muted:#94a3b8;--text:#e2e8f0;--line:#1f2937;--accent:#38bdf8;}
+    body{font-family:Inter,Arial,sans-serif;margin:0;background:linear-gradient(180deg,#0b1220,#111827);color:var(--text);}
+    .wrap{max-width:1400px;margin:0 auto;padding:22px;}
+    a{color:var(--accent);text-decoration:none}
+    .filters{margin:8px 0 14px}
+    .cards{display:flex;gap:12px;margin:16px 0;flex-wrap:wrap;}
+    .card{padding:14px 16px;background:var(--card);border:1px solid var(--line);border-radius:12px;min-width:200px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+    .k{display:block;color:var(--muted);font-size:12px;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em}
+    .v{font-size:26px;font-weight:700}
+    table{border-collapse:collapse;width:100%;font-size:13px;background:#0b1220;border:1px solid var(--line);border-radius:12px;overflow:hidden}
+    th,td{border-bottom:1px solid var(--line);padding:9px;vertical-align:top;}
+    th{background:#0b1020;color:#93c5fd;position:sticky;top:0}
+    tr:hover td{background:#0f1a30}
+    code{background:#0b1020;border:1px solid var(--line);padding:2px 6px;border-radius:6px}
+    "<div class='wrap'>",
+    f"<h1>📊 Collector Panel • {period_title}</h1>",
+    "<div class='filters'><a href='?period=day'>День</a> • <a href='?period=week'>Неделя</a> • <a href='?period=month'>Месяц</a> • <a href='/panel/map?period={0}'>Карта</a></div>".format(period),
+    f"<div class='cards'><div class='card'><span class='k'>Всего запросов</span><span class='v'>{stats['total']}</span></div><div class='card'><span class='k'>Уникальные IP</span><span class='v'>{stats['unique_ips']}</span></div><div class='card'><span class='k'>Уникальные HWID</span><span class='v'>{stats['unique_hwids']}</span></div></div>",
+    html.append("</table></div></body></html>")
+      <style>
+        :root{{--bg:#0b1220;--text:#e2e8f0;--accent:#38bdf8;--line:#1f2937;}}
+        body{{margin:0;font-family:Inter,Arial;background:var(--bg);color:var(--text);}}
+        #map{{height:calc(100vh - 58px);}}
+        .top{{height:58px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--line);background:#0f172a;}}
+        .top a{{color:var(--accent);text-decoration:none}}
+      </style>
 def get_whitelist():
     if not WHITELIST_OUTPUT.exists():
         return "Still checking, please wait...", 404
