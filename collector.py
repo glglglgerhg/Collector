@@ -35,6 +35,8 @@ app = Flask(__name__)
 WORK_DIR = Path(__file__).parent
 DATA_DIR = WORK_DIR / "vpn_data"
 DATA_DIR.mkdir(exist_ok=True)
+CACHE_DIR = DATA_DIR / "sub_cache"
+CACHE_DIR.mkdir(exist_ok=True)
 
 TANDEM_SERVERS = [
     {"url": "https://2.27.86.119:2096/sub/{secret}", "name": "Germany", "flag": "🇩🇪", "type": "general"},   
@@ -347,9 +349,32 @@ def test_vless_full(parsed):
     """
     Полная проверка VLESS:
     1. TCP connect (реальный пинг)
-    2. TLS handshake
-    3. HTTP запрос (проверка что прокси работает)
-    """
+def fetch_tandem_server(server, secret):
+        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, verify=False, timeout=5)
+        return []
+
+
+def get_cache_file(secret):
+    safe_secret = re.sub(r'[^a-zA-Z0-9_\-]', '_', secret)[:120]
+    return CACHE_DIR / f"{safe_secret}.txt"
+
+
+def save_cached_subscription(secret, content):
+    try:
+        cache_file = get_cache_file(secret)
+        cache_file.write_text(content, encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to save cache for secret {secret}: {e}")
+
+
+def load_cached_subscription(secret):
+    cache_file = get_cache_file(secret)
+    if cache_file.exists():
+        try:
+            return cache_file.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Failed to read cache for secret {secret}: {e}")
+    return None
     result = {
         'working': False,
         'ping': None,
@@ -664,23 +689,39 @@ def panel():
 def panel_map():
     period = request.args.get("period", "month")
     enqueue_subscription_access(secret)
-    with get_db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT client_ip, country, region_name, city, lat, lon, MAX(ts) AS last_ts, COUNT(*) AS cnt
-            FROM subscription_logs
-            WHERE ts >= ? AND lat IS NOT NULL AND lon IS NOT NULL
-            GROUP BY client_ip, country, region_name, city, lat, lon
-            ORDER BY last_ts DESC
-            LIMIT 2000
-            """,
-            (since_ts,)
-        ).fetchall()
-
-    markers = []
-    for row in rows:
-        markers.append({
-            "ip": row["client_ip"],
+    
+    all_configs = []
+    with ThreadPoolExecutor(max_workers=len(TANDEM_SERVERS)) as executor:
+        futures = [executor.submit(fetch_tandem_server, server, secret) for server in TANDEM_SERVERS]
+        for future in as_completed(futures):
+            try:
+                configs = future.result()
+                all_configs.extend(configs)
+            except Exception as e:
+                logger.error(f"Tandem fetch worker error: {e}")
+    
+    if not all_configs:
+        cached = load_cached_subscription(secret)
+        if cached:
+            return Response(cached, mimetype='text/plain', headers={
+                'Cache-Control': 'no-cache',
+                'X-Subscription-Cache': 'stale-fallback'
+            })
+        return Response(
+            "# Upstream servers are unavailable right now. Please retry in 1-2 minutes.",
+            status=503,
+            mimetype='text/plain'
+        )
+    
+    output = [
+        "# profile-title: VPN Tandem (NL + RU)",
+        "# profile-update-interval: 24",
+        f"# Количество: {len(all_configs)}",
+    ]
+    output.extend(all_configs)
+    final_content = "\n".join(output)
+    save_cached_subscription(secret, final_content)
+    return Response(final_content, mimetype='text/plain')
             "country": row["country"],
             "region_name": row["region_name"],
             "city": row["city"],
