@@ -18,10 +18,13 @@ import socket
 import ssl
 import threading
 import struct
+import sqlite3
+import os
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from collections import defaultdict
+from functools import wraps
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -49,6 +52,7 @@ WHITELIST_SOURCES = [
 MAX_WHITELIST_CONFIGS = 325
 WHITELIST_OUTPUT = DATA_DIR / "whitelist_checked.txt"
 WHITELIST_STATUS = DATA_DIR / "whitelist_status.json"
+DB_PATH = DATA_DIR / "data.db"
 
 # Настройки проверки
 MAX_WORKERS = 350
@@ -65,6 +69,132 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+PANEL_USER = os.getenv("PANEL_USER", "admin")
+PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "change-me")
+
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscription_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                secret TEXT,
+                requested_url TEXT NOT NULL,
+                client_ip TEXT,
+                hwid TEXT,
+                device TEXT,
+                os TEXT,
+                user_agent TEXT,
+                country TEXT,
+                region_name TEXT,
+                city TEXT,
+                lat REAL,
+                lon REAL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subscription_logs_ts ON subscription_logs(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subscription_logs_ip ON subscription_logs(client_ip)")
+
+
+def panel_auth_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth = request.authorization
+        if not auth or auth.username != PANEL_USER or auth.password != PANEL_PASSWORD:
+            return Response(
+                "Authentication required",
+                401,
+                {"WWW-Authenticate": 'Basic realm="Collector Panel"'}
+            )
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def get_client_ip():
+    xff = request.headers.get("X-Forwarded-For", "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    return (request.headers.get("X-Real-IP") or request.remote_addr or "").strip()
+
+
+def get_client_geo(ip):
+    if not ip or ip in ("127.0.0.1", "::1"):
+        return {}
+    try:
+        resp = requests.get(
+            f"http://ip-api.com/json/{ip}",
+            params={"fields": "status,country,regionName,city,lat,lon"},
+            timeout=2
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("status") == "success":
+                return {
+                    "country": data.get("country"),
+                    "region_name": data.get("regionName"),
+                    "city": data.get("city"),
+                    "lat": data.get("lat"),
+                    "lon": data.get("lon"),
+                }
+    except Exception:
+        pass
+    return {}
+
+
+def get_time_from_filter(period):
+    now = int(time.time())
+    if period == "day":
+        return now - 24 * 60 * 60
+    if period == "week":
+        return now - 7 * 24 * 60 * 60
+    return now - 30 * 24 * 60 * 60
+
+
+def log_subscription_access(secret):
+    client_ip = get_client_ip()
+    geo = get_client_geo(client_ip)
+    hwid = request.args.get("hwid") or request.headers.get("X-HWID", "")
+    device = request.args.get("device") or request.headers.get("X-Device", "")
+    os_name = request.args.get("os") or request.headers.get("X-OS", "")
+    user_agent = request.headers.get("User-Agent", "")
+    requested_url = request.full_path[:-1] if request.full_path.endswith("?") else request.full_path
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO subscription_logs (
+                ts, secret, requested_url, client_ip, hwid, device, os, user_agent,
+                country, region_name, city, lat, lon
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(time.time()),
+                secret,
+                requested_url,
+                client_ip,
+                hwid,
+                device,
+                os_name,
+                user_agent,
+                geo.get("country"),
+                geo.get("region_name"),
+                geo.get("city"),
+                geo.get("lat"),
+                geo.get("lon"),
+            )
+        )
+
+
+init_db()
 
 
 # ==================== ФУНКЦИИ ДЛЯ ТАНДЕМА ====================
@@ -417,6 +547,7 @@ def start_background_checker():
 def get_subscription(secret):
     if not secret or len(secret) < 3:
         abort(404)
+    log_subscription_access(secret)
     
     all_configs = []
     for server in TANDEM_SERVERS:
@@ -436,6 +567,129 @@ def get_subscription(secret):
     output.extend(all_configs)
     
     return Response("\n".join(output), mimetype='text/plain')
+
+
+@app.route('/panel/')
+@panel_auth_required
+def panel():
+    period = request.args.get("period", "month")
+    since_ts = get_time_from_filter(period)
+
+    with get_db_connection() as conn:
+        stats = conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(DISTINCT client_ip) AS unique_ips,
+                   COUNT(DISTINCT hwid) AS unique_hwids
+            FROM subscription_logs
+            WHERE ts >= ?
+            """,
+            (since_ts,)
+        ).fetchone()
+        rows = conn.execute(
+            """
+            SELECT ts, secret, requested_url, client_ip, hwid, device, os, user_agent, country, region_name, city
+            FROM subscription_logs
+            WHERE ts >= ?
+            ORDER BY ts DESC
+            LIMIT 500
+            """,
+            (since_ts,)
+        ).fetchall()
+
+    period_title = {"day": "последний день", "week": "последняя неделя", "month": "последний месяц"}.get(period, "последний месяц")
+    html = ["""
+    <html><head><meta charset='utf-8'><title>Collector Panel</title>
+    <style>
+    body{font-family:Arial,sans-serif;margin:20px;}
+    table{border-collapse:collapse;width:100%;font-size:13px;}
+    th,td{border:1px solid #ddd;padding:6px;vertical-align:top;}
+    th{background:#f4f4f4;}
+    .cards{display:flex;gap:10px;margin:16px 0;}
+    .card{padding:10px;border:1px solid #ddd;border-radius:6px;min-width:180px;}
+    </style></head><body>
+    """,
+    f"<h1>📊 Collector Panel ({period_title})</h1>",
+    "<p><a href='?period=day'>День</a> | <a href='?period=week'>Неделя</a> | <a href='?period=month'>Месяц</a> | <a href='/panel/map?period={0}'>Карта</a></p>".format(period),
+    f"<div class='cards'><div class='card'><b>Всего запросов</b><br>{stats['total']}</div><div class='card'><b>Уникальные IP</b><br>{stats['unique_ips']}</div><div class='card'><b>Уникальные HWID</b><br>{stats['unique_hwids']}</div></div>",
+    "<table><tr><th>Время (UTC)</th><th>IP</th><th>Локация</th><th>HWID</th><th>Устройство</th><th>OS</th><th>URL</th><th>User-Agent</th></tr>"
+    ]
+    for row in rows:
+        dt = datetime.utcfromtimestamp(row["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+        location = " / ".join([x for x in [row["country"], row["region_name"], row["city"]] if x]) or "—"
+        html.append(
+            f"<tr><td>{dt}</td><td>{row['client_ip'] or '—'}</td><td>{location}</td><td>{row['hwid'] or '—'}</td>"
+            f"<td>{row['device'] or '—'}</td><td>{row['os'] or '—'}</td><td><code>{row['requested_url']}</code></td><td>{row['user_agent'] or '—'}</td></tr>"
+        )
+    html.append("</table></body></html>")
+    return Response("".join(html), mimetype='text/html')
+
+
+@app.route('/panel/map')
+@panel_auth_required
+def panel_map():
+    period = request.args.get("period", "month")
+    since_ts = get_time_from_filter(period)
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT client_ip, country, region_name, city, lat, lon, MAX(ts) AS last_ts, COUNT(*) AS cnt
+            FROM subscription_logs
+            WHERE ts >= ? AND lat IS NOT NULL AND lon IS NOT NULL
+            GROUP BY client_ip, country, region_name, city, lat, lon
+            ORDER BY last_ts DESC
+            LIMIT 2000
+            """,
+            (since_ts,)
+        ).fetchall()
+
+    markers = []
+    for row in rows:
+        markers.append({
+            "ip": row["client_ip"],
+            "country": row["country"],
+            "region_name": row["region_name"],
+            "city": row["city"],
+            "lat": row["lat"],
+            "lon": row["lon"],
+            "last_ts": row["last_ts"],
+            "cnt": row["cnt"],
+        })
+
+    period_title = {"day": "последний день", "week": "последняя неделя", "month": "последний месяц"}.get(period, "последний месяц")
+    return f"""
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Collector Map</title>
+      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+      <style>body{{margin:0;font-family:Arial;}} #map{{height:90vh;}} .top{{padding:10px;}}</style>
+    </head>
+    <body>
+      <div class="top">
+        <b>🗺️ Карта запросов ({period_title})</b> |
+        <a href="/panel/map?period=day">День</a> |
+        <a href="/panel/map?period=week">Неделя</a> |
+        <a href="/panel/map?period=month">Месяц</a> |
+        <a href="/panel/?period={period}">Таблица</a>
+      </div>
+      <div id="map"></div>
+      <script>
+        const map = L.map('map').setView([20, 0], 2);
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+          maxZoom: 18
+        }}).addTo(map);
+        const points = {json.dumps(markers)};
+        for (const p of points) {{
+          const dt = new Date(p.last_ts * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+          const text = `<b>${{p.ip || 'unknown'}}</b><br>${{[p.country, p.region_name, p.city].filter(Boolean).join(' / ')}}<br>Запросов: ${{p.cnt}}<br>Последний: ${{dt}}`;
+          L.circleMarker([p.lat, p.lon], {{radius: Math.min(12, 4 + p.cnt), color: '#2563eb'}}).addTo(map).bindPopup(text);
+        }}
+      </script>
+    </body>
+    </html>
+    """
 
 
 @app.route('/whitelist')
