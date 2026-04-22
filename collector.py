@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+VPN Configs Collector & Proxy - РАБОЧАЯ ВЕРСИЯ
+- /sub/СЕКРЕТ — тандем двух серверов
+- /whitelist — жесткая проверка VLESS (TCP + TLS + VLESS handshake)
+"""
+
+from flask import Flask, Response, request, abort
+import requests
+import base64
+import re
+import time
+import logging
+import sys
+import json
+import socket
+import ssl
+import threading
+import struct
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from collections import defaultdict
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+app = Flask(__name__)
+
+# ==================== НАСТРОЙКИ ====================
+WORK_DIR = Path(__file__).parent
+DATA_DIR = WORK_DIR / "vpn_data"
+DATA_DIR.mkdir(exist_ok=True)
+
+TANDEM_SERVERS = [
+    {"url": "https://2.27.86.119:2096/sub/{secret}", "name": "Germany", "flag": "🇩🇪", "type": "general"},   
+    {"url": "https://195.133.9.107:2096/sub/{secret}", "name": "Netherlands", "flag": "🇳🇱", "type": "reserve"},
+]
+
+WHITELIST_SOURCES = [
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt",
+    "https://raw.githubusercontent.com/ShatakVPN/ConfigForge-V2Ray/main/configs/all.txt",
+    "https://raw.githubusercontent.com/ShatakVPN/ConfigForge-V2Ray/main/configs/vless.txt",
+    "https://raw.githubusercontent.com/MahanKenway/Freedom-V2Ray/main/configs/mix.txt",
+]
+
+MAX_WHITELIST_CONFIGS = 325
+WHITELIST_OUTPUT = DATA_DIR / "whitelist_checked.txt"
+WHITELIST_STATUS = DATA_DIR / "whitelist_status.json"
+
+# Настройки проверки
+MAX_WORKERS = 350
+TCP_TIMEOUT = 3
+TLS_TIMEOUT = 3
+HTTP_TIMEOUT = 2
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    handlers=[
+        logging.FileHandler(DATA_DIR / "collector.log", encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+# ==================== ФУНКЦИИ ДЛЯ ТАНДЕМА ====================
+
+def decode_subscription(content):
+    try:
+        content = content.strip()
+        if not content.startswith(('vless://', 'vmess://', 'ss://', 'trojan://')):
+            decoded = base64.b64decode(content).decode('utf-8')
+            return decoded
+        return content
+    except Exception as e:
+        logger.error(f"Decode error: {e}")
+        return None
+
+
+def extract_configs(text):
+    configs = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(('vless://', 'vmess://', 'ss://', 'trojan://', 'hysteria2://')):
+            configs.append(line)
+    return configs
+
+
+def extract_name_from_config(config):
+    match = re.search(r'#([^#]+)$', config)
+    if match:
+        name = match.group(1).strip()
+        name = re.split(r'[-_\s]', name)[0]
+        name = re.sub(r'[^\w]', '', name)
+        if name:
+            return name
+    return None
+
+
+def fetch_tandem_server(server, secret):
+    try:
+        url = server["url"].format(secret=secret)
+        logger.info(f"Fetching from {server['name']}: {url}")
+        
+        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, verify=False, timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"HTTP {response.status_code} from {server['name']}")
+            return []
+        
+        subscription_text = decode_subscription(response.text)
+        if not subscription_text:
+            logger.error(f"Failed to decode from {server['name']}")
+            return []
+        
+        configs = extract_configs(subscription_text)
+        logger.info(f"Got {len(configs)} configs from {server['name']}")
+        
+        fixed_configs = []
+        for cfg in configs:
+            suffix = "🎬 YouTube" if server["type"] == "youtube" else "🌍 General"
+            name = extract_name_from_config(cfg)
+            new_name = f"{server['flag']} {server['name']} | {suffix}" + (f" | {name}" if name else "")
+            cfg = re.sub(r'#.*$', '', cfg)
+            fixed_configs.append(f"{cfg}#{new_name}")
+        
+        return fixed_configs
+        
+    except Exception as e:
+        logger.error(f"Error from {server['name']}: {e}")
+        return []
+
+
+# ==================== ПАРСИНГ VLESS ====================
+
+def parse_vless_config(config):
+    """Парсит VLESS конфиг"""
+    match = re.match(r'vless://([a-f0-9\-]+)@([^:]+):(\d+)(\?[^#]*)?#?(.*)?', config)
+    if not match:
+        return None
+    
+    uuid, host, port, params, name = match.groups()
+    port = int(port)
+    params = params or ''
+    
+    parsed = {
+        'uuid': uuid,
+        'host': host,
+        'port': port,
+        'name': name or '',
+        'security': 'tls',
+        'sni': host,
+        'raw': config,
+        'flow': ''
+    }
+    
+    if params and params.startswith('?'):
+        for param in params[1:].split('&'):
+            if '=' in param:
+                k, v = param.split('=', 1)
+                if k == 'security':
+                    parsed['security'] = v
+                elif k == 'sni':
+                    parsed['sni'] = v
+                elif k == 'flow':
+                    parsed['flow'] = v
+    
+    try:
+        parsed['resolved_ip'] = socket.gethostbyname(host)
+    except:
+        parsed['resolved_ip'] = host
+    
+    return parsed
+
+
+# ==================== ЖЕСТКАЯ ПРОВЕРКА ====================
+
+def test_vless_full(parsed):
+    """
+    Полная проверка VLESS:
+    1. TCP connect (реальный пинг)
+    2. TLS handshake
+    3. HTTP запрос (проверка что прокси работает)
+    """
+    result = {
+        'working': False,
+        'ping': None,
+        'tcp_ms': None,
+        'tls_ms': None,
+        'http_ok': False,
+        'error': None,
+        'parsed': parsed
+    }
+    
+    # 1. TCP connect
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(TCP_TIMEOUT)
+        start_tcp = time.time()
+        sock.connect((parsed['resolved_ip'], parsed['port']))
+        tcp_time = (time.time() - start_tcp) * 1000
+        result['tcp_ms'] = round(tcp_time, 1)
+        result['ping'] = round(tcp_time, 1)
+    except Exception as e:
+        result['error'] = f"TCP: {str(e)[:30]}"
+        return result
+    
+    # 2. TLS handshake (если security=tls)
+    if parsed['security'] == 'tls':
+        try:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            
+            start_tls = time.time()
+            sock_tls = context.wrap_socket(sock, server_hostname=parsed['sni'])
+            sock_tls.do_handshake()
+            tls_time = (time.time() - start_tls) * 1000
+            result['tls_ms'] = round(tls_time, 1)
+            
+            # 3. HTTP запрос (простейшая проверка)
+            try:
+                http_request = f"GET / HTTP/1.1\r\nHost: {parsed['sni']}\r\nConnection: close\r\n\r\n"
+                sock_tls.send(http_request.encode())
+                sock_tls.settimeout(HTTP_TIMEOUT)
+                response = sock_tls.recv(256)
+                if response and (b'HTTP/' in response or b'200' in response or b'301' in response or b'302' in response):
+                    result['http_ok'] = True
+            except:
+                pass
+            
+            sock_tls.close()
+            result['working'] = True
+            
+        except Exception as e:
+            result['error'] = f"TLS: {str(e)[:30]}"
+            sock.close()
+    else:
+        sock.close()
+        result['working'] = True
+    
+    return result
+
+
+# ==================== СБОР КОНФИГОВ ====================
+
+def fetch_vless_configs():
+    """Собирает VLESS конфиги из всех источников"""
+    logger.info("=" * 60)
+    logger.info("📡 СБОР VLESS КОНФИГОВ")
+    logger.info("=" * 60)
+    
+    all_configs = []
+    seen = set()
+    
+    for url in WHITELIST_SOURCES:
+        try:
+            logger.info(f"  Загрузка: {url.split('/')[-1][:40]}...")
+            response = requests.get(url, timeout=30, verify=False)
+            
+            if response.status_code != 200:
+                logger.warning(f"    ❌ HTTP {response.status_code}")
+                continue
+            
+            added = 0
+            for line in response.text.splitlines():
+                line = line.strip()
+                if line.startswith('vless://'):
+                    if line not in seen:
+                        seen.add(line)
+                        all_configs.append(line)
+                        added += 1
+            
+            logger.info(f"    ✅ Добавлено {added} VLESS конфигов")
+            
+        except Exception as e:
+            logger.error(f"    ❌ Ошибка: {e}")
+    
+    logger.info(f"\n📊 Всего уникальных VLESS конфигов: {len(all_configs)}")
+    return all_configs
+
+
+# ==================== ОСНОВНАЯ ПРОВЕРКА ====================
+
+def run_whitelist_check():
+    """Основная функция проверки"""
+    logger.info("=" * 60)
+    logger.info("🚀 ЖЕСТКАЯ ПРОВЕРКА WHITELIST (TCP + TLS + HTTP)")
+    logger.info("=" * 60)
+    
+    start_time = time.time()
+    
+    # 1. Собираем конфиги
+    all_configs = fetch_vless_configs()
+    if not all_configs:
+        logger.warning("❌ Нет VLESS конфигов для проверки")
+        return
+    
+    # 2. Парсим
+    logger.info("🔍 Парсинг конфигов...")
+    parsed_configs = []
+    for cfg in all_configs:
+        p = parse_vless_config(cfg)
+        if p:
+            parsed_configs.append(p)
+    
+    logger.info(f"✅ Распарсено: {len(parsed_configs)}/{len(all_configs)}")
+    
+    if not parsed_configs:
+        logger.warning("❌ Нет валидных конфигов")
+        return
+    
+    # 3. Проверяем
+    logger.info(f"⚡ Проверка {len(parsed_configs)} серверов ({MAX_WORKERS} потоков)...")
+    
+    valid_results = []
+    stats = {'total': len(parsed_configs), 'tcp_ok': 0, 'http_ok': 0}
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(test_vless_full, p): p for p in parsed_configs}
+        
+        for i, future in enumerate(as_completed(futures), 1):
+            result = future.result()
+            
+            if result['working']:
+                stats['tcp_ok'] += 1
+                if result.get('http_ok'):
+                    stats['http_ok'] += 1
+                valid_results.append(result)
+            
+            # Показываем прогресс
+            if i % 100 == 0:
+                logger.info(f"  Прогресс: {i}/{stats['total']}, найдено: {len(valid_results)}")
+    
+    # 4. Сортируем по пингу
+    valid_results.sort(key=lambda x: x['ping'])
+    
+    # 5. Ограничиваем количество
+    if len(valid_results) > MAX_WHITELIST_CONFIGS:
+        valid_results = valid_results[:MAX_WHITELIST_CONFIGS]
+        logger.info(f"✂️ Ограничено до {MAX_WHITELIST_CONFIGS} конфигов")
+    
+    # 6. Сохраняем
+    with open(WHITELIST_OUTPUT, 'w', encoding='utf-8') as f:
+        f.write(f"# profile-title: Whitelist_Valid_{len(valid_results)}conf\n")
+        f.write(f"# profile-update-interval: 4\n")
+        f.write(f"# Date/Time: {datetime.now().strftime('%Y-%m-%d / %H:%M')} (UTC)\n")
+        f.write(f"# Количество: {len(valid_results)}\n")
+        f.write(f"# Проверка: TCP + TLS + HTTP\n")
+        f.write("# =============================================\n\n")
+        
+        for result in valid_results:
+            p = result['parsed']
+            ping = result['ping']
+            http_flag = "🌐" if result.get('http_ok') else "🔒"
+            name = p['name'][:40] if p['name'] else p['host']
+            raw = re.sub(r'#.*$', '', p['raw'])
+            f.write(f"{raw}#{http_flag} {ping}ms | {name}\n")
+    
+    # 7. Статистика
+    duration = time.time() - start_time
+    
+    logger.info("=" * 60)
+    logger.info("📊 РЕЗУЛЬТАТЫ ПРОВЕРКИ")
+    logger.info("=" * 60)
+    logger.info(f"⏱️  Время: {duration:.1f} сек")
+    logger.info(f"📈 Скорость: {stats['total']/duration:.1f} конф/сек")
+    logger.info(f"✅ Рабочих VLESS: {len(valid_results)}/{stats['total']}")
+    logger.info(f"🌐 С HTTP ответом: {stats['http_ok']}")
+    
+    # Топ-10
+    if valid_results:
+        logger.info("\n🔝 ТОП-10 САМЫХ БЫСТРЫХ:")
+        for i, r in enumerate(valid_results[:10], 1):
+            p = r['parsed']
+            ping = r['ping']
+            flag = "🌐" if r.get('http_ok') else "🔒"
+            logger.info(f"  {i:2}. [{ping:3}ms] {flag} {p['resolved_ip']}:{p['port']} | {p['name'][:35]}")
+    
+    with open(WHITELIST_STATUS, 'w') as f:
+        json.dump({
+            "last_check": time.time(),
+            "total_configs": len(all_configs),
+            "valid_configs": len(valid_results),
+            "duration": duration,
+            "check_type": "tcp_tls_http_350_threads"
+        }, f)
+    
+    logger.info(f"✅ Whitelist проверка завершена")
+    logger.info(f"💾 Результаты сохранены в {WHITELIST_OUTPUT}")
+
+
+def start_background_checker():
+    def checker_loop():
+        time.sleep(10)
+        while True:
+            try:
+                run_whitelist_check()
+            except Exception as e:
+                logger.error(f"Checker error: {e}")
+                import traceback
+                traceback.print_exc()
+            time.sleep(4 * 60 * 60)
+    
+    thread = threading.Thread(target=checker_loop, daemon=True)
+    thread.start()
+    logger.info("🔄 Фоновый проверщик запущен (каждые 4 часа)")
+
+
+# ==================== ROUTES ====================
+
+@app.route('/sub/<secret>')
+def get_subscription(secret):
+    if not secret or len(secret) < 3:
+        abort(404)
+    
+    all_configs = []
+    for server in TANDEM_SERVERS:
+        configs = fetch_tandem_server(server, secret)
+        all_configs.extend(configs)
+    
+    if not all_configs:
+        abort(404)
+    
+    output = [
+        "# profile-title: VPN Tandem (NL + RU)",
+        "# profile-update-interval: 24",
+        f"# Количество: {len(all_configs)}",
+        "# =============================================",
+        ""
+    ]
+    output.extend(all_configs)
+    
+    return Response("\n".join(output), mimetype='text/plain')
+
+
+@app.route('/whitelist')
+@app.route('/whitelist/')
+def get_whitelist():
+    if not WHITELIST_OUTPUT.exists():
+        return "Still checking, please wait...", 404
+    
+    with open(WHITELIST_OUTPUT, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    return Response(content, mimetype='text/plain', headers={
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': '*'
+    })
+
+
+@app.route('/whitelist/status')
+def whitelist_status():
+    if WHITELIST_STATUS.exists():
+        with open(WHITELIST_STATUS, 'r') as f:
+            return json.load(f)
+    return {"status": "not yet checked"}
+
+
+@app.route('/health')
+def health():
+    return {
+        "status": "healthy",
+        "whitelist_ready": WHITELIST_OUTPUT.exists(),
+        "check_type": "tcp_tls_http_350_threads"
+    }
+
+
+@app.route('/')
+def index():
+    return """
+    <h1>VPN Configs Proxy</h1>
+    <ul>
+        <li><code>/sub/СЕКРЕТ</code> - тандем NL + RU</li>
+        <li><code>/whitelist</code> - жесткая проверка VLESS (350 потоков)</li>
+        <li><code>/whitelist/status</code> - статус проверки</li>
+        <li><code>/health</code> - health check</li>
+    </ul>
+    """
+
+
+if __name__ == '__main__':
+    start_background_checker()
+    app.run(host='127.0.0.1', port=2095, debug=False, threaded=True)
