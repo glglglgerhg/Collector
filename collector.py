@@ -702,13 +702,79 @@ def panel_map():
     </head>
     <body>
       <div class="top">
-        <b>🗺️ Карта запросов ({period_title})</b> |
-        <a href="/panel/map?period=day">День</a> |
-        <a href="/panel/map?period=week">Неделя</a> |
-        <a href="/panel/map?period=month">Месяц</a> |
-        <a href="/panel/?period={period}">Таблица</a>
-      </div>
-      <div id="map"></div>
+        hwid_rows = conn.execute(
+            """
+            SELECT l.hwid,
+                   COUNT(*) AS req_count,
+                   MAX(l.ts) AS last_ts,
+                   (
+                       SELECT ll.client_ip
+                       FROM subscription_logs ll
+                       WHERE ll.hwid = l.hwid AND ll.ts >= ?
+                       ORDER BY ll.ts DESC
+                       LIMIT 1
+                   ) AS last_ip,
+                   (
+                       SELECT ll.country
+                       FROM subscription_logs ll
+                       WHERE ll.hwid = l.hwid AND ll.ts >= ?
+                       ORDER BY ll.ts DESC
+                       LIMIT 1
+                   ) AS country,
+                   (
+                       SELECT ll.region_name
+                       FROM subscription_logs ll
+                       WHERE ll.hwid = l.hwid AND ll.ts >= ?
+                       ORDER BY ll.ts DESC
+                       LIMIT 1
+                   ) AS region_name,
+                   (
+                       SELECT ll.city
+                       FROM subscription_logs ll
+                       WHERE ll.hwid = l.hwid AND ll.ts >= ?
+                       ORDER BY ll.ts DESC
+                       LIMIT 1
+                   ) AS city,
+                   (
+                       SELECT ll.os
+                       FROM subscription_logs ll
+                       WHERE ll.hwid = l.hwid AND ll.ts >= ?
+                       ORDER BY ll.ts DESC
+                       LIMIT 1
+                   ) AS os,
+                   (
+                       SELECT ll.device
+                       FROM subscription_logs ll
+                       WHERE ll.hwid = l.hwid AND ll.ts >= ?
+                       ORDER BY ll.ts DESC
+                       LIMIT 1
+                   ) AS device
+            FROM subscription_logs l
+            WHERE l.ts >= ? AND l.hwid IS NOT NULL AND TRIM(l.hwid) != ''
+            GROUP BY l.hwid
+            ORDER BY last_ts DESC
+            LIMIT 500
+            """,
+            (since_ts, since_ts, since_ts, since_ts, since_ts, since_ts, since_ts)
+        ).fetchall()
+        no_hwid_rows = conn.execute(
+            WHERE ts >= ? AND (hwid IS NULL OR TRIM(hwid) = '')
+            LIMIT 200
+    "<h2>HWID (агрегировано)</h2>",
+    "<table><tr><th>HWID</th><th>Запросов</th><th>Последний запрос (UTC)</th><th>Последний IP</th><th>Локация</th><th>Устройство</th><th>OS</th></tr>"
+    for row in hwid_rows:
+        dt = datetime.utcfromtimestamp(row["last_ts"]).strftime("%Y-%m-%d %H:%M:%S")
+        location = " / ".join([x for x in [row["country"], row["region_name"], row["city"]] if x]) or "—"
+        html.append(
+            f"<tr><td>{row['hwid']}</td><td>{row['req_count']}</td><td>{dt}</td><td>{row['last_ip'] or '—'}</td><td>{location}</td>"
+            f"<td>{row['device'] or '—'}</td><td>{row['os'] or '—'}</td></tr>"
+        )
+
+    html.append("</table><h2 style='margin-top:20px'>Запросы без HWID</h2>")
+    html.append("<table><tr><th>Время (UTC)</th><th>IP</th><th>Локация</th><th>Geo source</th><th>URL</th><th>User-Agent</th></tr>")
+    for row in no_hwid_rows:
+            f"<tr><td>{dt}</td><td>{row['client_ip'] or '—'}</td><td>{location}</td><td>{row['geo_source'] or '—'}</td>"
+            f"<td><code>{row['requested_url']}</code></td><td>{row['user_agent'] or '—'}</td></tr>"
       <script>
         const map = L.map('map').setView([20, 0], 2);
         L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
